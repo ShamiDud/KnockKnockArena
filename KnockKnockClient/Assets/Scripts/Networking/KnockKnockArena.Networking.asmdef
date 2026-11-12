@@ -1,0 +1,9 @@
+{
+    "name": "KnockKnockArena.Networking",
+    "rootNamespace": "KnockKnockArena.Networking",
+    "references": [
+        "KnockKnockArena.Shared",
+        "KnockKnockArena.Gameplay"
+    ],
+    "autoReferenced": true
+}
