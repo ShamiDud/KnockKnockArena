@@ -2,12 +2,21 @@ using System;
 
 namespace KnockKnockArena.Server;
 
+/// <summary>
+/// Server configuration, from command-line arguments:
+///
+///   args: --port N, --max-players N, --name TEXT, --verbose
+/// </summary>
 public sealed class ServerConfig
 {
-    /// <summary>The TCP listener's port (M05: the UDP socket uses the same number).</summary>
+    /// <summary>Used for BOTH the TCP listener and the UDP socket (same number, two protocols).</summary>
     public int Port { get; private set; } = 36363;
 
     public int MaxPlayers { get; private set; } = 12;
+
+    /// <summary>What LAN discovery shows for this instance. Defaults to the machine
+    /// name, so two servers on one LAN tell apart.</summary>
+    public string ServerName { get; private set; } = Environment.MachineName;
 
     public bool Verbose { get; private set; }
 
@@ -27,12 +36,16 @@ public sealed class ServerConfig
                     config.MaxPlayers = max;
                     i++;
                     break;
+                case "--name" when i + 1 < args.Length:
+                    config.ServerName = args[i + 1];
+                    i++;
+                    break;
                 case "--verbose":
                     config.Verbose = true;
                     break;
                 default:
                     throw new ArgumentException($"Unknown argument '{args[i]}'. " +
-                        "Usage: --port N --max-players N --verbose");
+                        "Usage: --port N --max-players N --name TEXT --verbose");
             }
         }
 
@@ -41,6 +54,9 @@ public sealed class ServerConfig
         if (config.MaxPlayers < 1)
             throw new ArgumentException($"Max players {config.MaxPlayers} is out of range (at least 1).");
 
+        // Player ids double as snapshot entity ids, and pickups start at entity id
+        // 100. A player id of 100+ would collide with a pickup, so the id ranges are
+        // absolute: players 1-99, pickups 100-999, rockets 1000+.
         int maxPlayerId = KnockKnockArena.Shared.Simulation.GameConstants.PickupEntityIdBase - 1;
         if (config.MaxPlayers > maxPlayerId)
         {

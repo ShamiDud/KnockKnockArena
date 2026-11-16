@@ -10,6 +10,10 @@ using KnockKnockArena.Shared.Simulation;
 
 namespace KnockKnockArena.Server.Net;
 
+/// <summary>
+/// The TCP side of the game server: login, chat and important events.
+/// One accept loop, one thread per client (the pattern taught in T04).
+/// </summary>
 public sealed class TcpGameServer
 {
     public const string ServerVersion = "0.6.0";
@@ -21,6 +25,10 @@ public sealed class TcpGameServer
     private readonly DateTime _startedUtc = DateTime.UtcNow;
 
     private TcpListener? _listener;
+
+    /// <summary>Raised after a player's session is gone (TCP disconnect or kick);
+    /// wired up to despawn the player from the game world.</summary>
+    public event Action<PlayerSession>? PlayerDisconnected;
 
     public TcpGameServer(ServerConfig config, SessionManager sessions)
     {
@@ -76,17 +84,20 @@ public sealed class TcpGameServer
                 }
                 catch (ProtocolException ex) when (!ex.IsFatal)
                 {
+                    // Payload-level problem; the framing is intact, so we can keep reading.
                     Log.Warn($"REJECT {type} from {connection.DisplayName}: {ex.Reason}");
                 }
             }
         }
         catch (ProtocolException ex)
         {
+            // Fatal framing error: the stream is desynced and must be dropped.
             Log.Warn($"REJECT from {connection.DisplayName}: {ex.Reason} (dropping connection)");
             disconnectReason = ex.Reason;
         }
         catch (Exception ex)
         {
+            // Socket errors (client vanished, connection reset...) end up here.
             disconnectReason = ex.Message;
         }
         finally
@@ -112,6 +123,9 @@ public sealed class TcpGameServer
 
     private void HandleLogin(ClientConnection connection, byte[] payload)
     {
+        // A client on another protocol version must be TOLD, not silently dropped —
+        // otherwise it hangs on "connecting" with no clue why, which is exactly what
+        // the version byte exists to prevent. Answer in our format, then close.
         if (payload.Length > 0 && payload[0] != ProtocolConstants.Version)
         {
             string versionError = $"protocol version {payload[0]} not supported, server runs {ProtocolConstants.Version}";
@@ -164,6 +178,9 @@ public sealed class TcpGameServer
                 Username = session.Username,
             }.ToPayload(), except: connection);
 
+            // Roster replay: PlayerJoined broadcasts only cover FUTURE joins, but the
+            // newcomer needs names for everyone already online (scoreboard, kill
+            // feed). Same message type, sent only to the new connection.
             foreach (PlayerSession existing in _sessions.GetAll())
             {
                 if (existing.PlayerId == session.PlayerId)
@@ -198,6 +215,8 @@ public sealed class TcpGameServer
 
         Log.Info($"Chat {connection.Session.Username}: {chat.Text}");
 
+        // Echoed to everyone, including the sender — the sender's own line comes
+        // from the server, so all clients render chat identically.
         Broadcast(MessageType.ChatBroadcast, new ChatBroadcast
         {
             PlayerId = connection.Session.PlayerId,
@@ -206,6 +225,7 @@ public sealed class TcpGameServer
         }.ToPayload());
     }
 
+    /// <summary>Sends a message to every authenticated client (optionally excluding one).</summary>
     private void Broadcast(MessageType type, byte[] payload, ClientConnection? except = null)
     {
         ClientConnection[] snapshot;
@@ -242,6 +262,7 @@ public sealed class TcpGameServer
         if (session != null)
         {
             _sessions.Remove(session.PlayerId);
+            PlayerDisconnected?.Invoke(session);
             Broadcast(MessageType.PlayerLeft, new PlayerLeft
             {
                 PlayerId = session.PlayerId,
@@ -253,6 +274,36 @@ public sealed class TcpGameServer
         else
         {
             Log.Info($"Connection closed: {connection.RemoteEndPoint} ({reason})");
+        }
+    }
+
+    /// <summary>
+    /// Disconnects a player server-side (e.g. on UDP timeout): the normal disconnect
+    /// path (session removal, PlayerLeft broadcast, despawn), with the kick's reason.
+    /// </summary>
+    public void KickByPlayerId(byte playerId, string reason)
+    {
+        ClientConnection? target = null;
+        lock (_clientsGate)
+        {
+            foreach (ClientConnection client in _clients)
+            {
+                if (client.Session?.PlayerId == playerId)
+                {
+                    target = client;
+                    break;
+                }
+            }
+        }
+
+        if (target != null)
+        {
+            Log.Info($"Kicking {target.DisplayName}: {reason}");
+            // Disconnect here, with the real reason: the client's read loop fails when the
+            // socket closes and runs Disconnect too, but by then the connection is gone
+            // from the list and nothing happens twice - the log says "udp timeout", not
+            // the socket exception the read loop sees.
+            Disconnect(target, reason);
         }
     }
 }

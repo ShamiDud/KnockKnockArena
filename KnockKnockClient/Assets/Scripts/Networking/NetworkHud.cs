@@ -1,14 +1,18 @@
 using System.Collections.Generic;
+using KnockKnockArena.Shared.Protocol.Udp;
 using UnityEngine;
 
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 4: the dev UI — connect panel, HUD, chat and the
-    /// joined/left feed. It only reads NetworkBootstrap's public properties, listens to
-    /// its two events and calls its public methods; it never touches the network.
-    /// Put it in Assets/Scripts/Networking next to NetworkBootstrap. It adds itself to
-    /// the NetworkBootstrap object when the scene starts, so nothing in the scene changes.
+    /// Handed out (Moodle), module 5 after implementation 5: the dev UI — connect panel
+    /// with "Find LAN servers" and the list of servers that answered, HUD with the UDP
+    /// join and heartbeat counters, chat and the joined/left feed. It replaces the
+    /// NetworkHud.cs from implementation 4. It only reads NetworkBootstrap's public
+    /// properties, listens to its two events and calls its public methods; it never
+    /// touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
+    /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
+    /// the scene changes.
     /// </summary>
     public sealed class NetworkHud : MonoBehaviour
     {
@@ -29,6 +33,9 @@ namespace KnockKnockArena.Networking
         private bool _chatOpen;
         private bool _chatFocusRequested;
         private readonly List<(string Text, float Time)> _feed = new List<(string, float)>();
+
+        // How far the list of LAN servers is scrolled.
+        private Vector2 _serverListScroll;
 
         private void Awake()
         {
@@ -96,7 +103,7 @@ namespace KnockKnockArena.Networking
         {
             // Solid black panel with white text: the default box is see-through, and
             // the rest of the dev UI draws black text for the in-game overlay.
-            Rect panel = new Rect(20, 20, 400, 220);
+            Rect panel = new Rect(20, 20, 400, 360);
             Color previousColor = GUI.color;
             Color previousContent = GUI.contentColor;
             GUI.color = Color.black;
@@ -123,20 +130,54 @@ namespace KnockKnockArena.Networking
             _net.Password = GUILayout.PasswordField(_net.Password, '*');
             GUILayout.EndHorizontal();
 
+            GUILayout.BeginHorizontal();
             GUI.enabled = !_net.IsConnecting;
             if (GUILayout.Button("Connect"))
                 _net.Connect();
+            GUI.enabled = !_net.IsConnecting && !_net.IsSearchingLan;
+            if (GUILayout.Button("Find LAN servers"))
+                _net.FindLanServers();
             GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            DrawServerList();
 
             GUILayout.Label(_net.StatusLine);
             GUILayout.EndArea();
             GUI.contentColor = previousContent;
         }
 
+        private void DrawServerList()
+        {
+            if (_net.LanStatus.Length == 0)
+                return;
+
+            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(120));
+            GUILayout.Label(_net.LanStatus);
+            foreach (DiscoveredServer server in _net.LanServers)
+            {
+                GUILayout.BeginHorizontal();
+                if (server.Info == null)
+                {
+                    GUILayout.Label($"{server.Address}:{server.SourcePort}  protocol v{server.ProtocolVersion} (incompatible)");
+                }
+                else
+                {
+                    GUILayout.Label($"{server.Info.ServerName}  {server.Info.PlayersOnline}/{server.Info.MaxPlayers}");
+                    GUI.enabled = !_net.IsConnecting;
+                    if (GUILayout.Button("Join", GUILayout.Width(50)))
+                        _net.JoinLanServer(server);
+                    GUI.enabled = true;
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndScrollView();
+        }
+
         private void DrawHud()
         {
-            GUILayout.BeginArea(new Rect(20, 20, 780, 80));
-            GUILayout.Label(_net.StatusLine);
+            GUILayout.BeginArea(new Rect(20, 20, 780, 100));
+            GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
+            GUILayout.Label($"UDP: joins sent={_net.JoinsSent}  heartbeats={_net.HeartbeatsSent}");
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
             GUILayout.Label("Enter chat");
             GUILayout.EndArea();

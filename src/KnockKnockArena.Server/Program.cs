@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Threading;
 using KnockKnockArena.Server;
 using KnockKnockArena.Server.Auth;
+using KnockKnockArena.Server.Game;
 using KnockKnockArena.Server.Net;
 
 // The log writes numbers the same way on every machine, in Docker too: 0.17, never 0,17.
@@ -24,11 +25,26 @@ Log.VerboseEnabled = config.Verbose;
 
 Log.Info($"KnockKnock Arena server v{TcpGameServer.ServerVersion} " +
          $"(protocol v{KnockKnockArena.Shared.Protocol.ProtocolConstants.Version})");
-Log.Info($"port={config.Port} maxPlayers={config.MaxPlayers} verbose={(config.Verbose ? "on" : "off")}");
+Log.Info($"name=\"{config.ServerName}\" port={config.Port} maxPlayers={config.MaxPlayers} " +
+         $"verbose={(config.Verbose ? "on" : "off")}");
 
 SessionManager sessions = new(config.MaxPlayers);
+GameWorld world = new();
+
 TcpGameServer server = new(config, sessions);
+UdpGameServer udpServer = new(config, sessions, world);
+
+// TCP disconnect (or kick) -> remove the player from the game world.
+server.PlayerDisconnected += session =>
+{
+    if (world.TryDespawn(session.PlayerId))
+        Log.Info($"Despawned {session.Username}#{session.PlayerId} from game world");
+};
+// UDP silence -> full disconnect (S01: timeout gives a TCP event + despawn).
+udpServer.KickPlayer = server.KickByPlayerId;
+
 server.Start();
+udpServer.Start();
 
 using ManualResetEventSlim shutdown = new();
 Console.CancelKeyPress += (_, e) =>
@@ -50,7 +66,8 @@ while (!shutdown.IsSet)
         case "status":
             Log.Info($"version={TcpGameServer.ServerVersion} " +
                      $"uptime={server.Uptime:hh\\:mm\\:ss} " +
-                     $"players={server.PlayersOnline}/{config.MaxPlayers}");
+                     $"players={server.PlayersOnline}/{config.MaxPlayers} " +
+                     $"inGame={world.PlayerCount} tick={world.ServerTick}");
             break;
         case "quit":
             shutdown.Set();

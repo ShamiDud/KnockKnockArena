@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using KnockKnockArena.Shared.Protocol.Messages;
+using KnockKnockArena.Shared.Protocol.Udp;
 using UnityEngine;
 
 namespace KnockKnockArena.Networking
@@ -11,9 +12,10 @@ namespace KnockKnockArena.Networking
     /// student base project is produced by deleting the Networking folder and this
     /// object from the scene.
     ///
-    /// MODULE 4: TCP only. Login, chat and the joined/left feed. The receive thread in
-    /// NetworkClient parses and queues; Update() drains the queue on the main thread —
-    /// the only thread allowed to touch Unity. The dev UI is NetworkHud (handed out):
+    /// MODULE 5: TCP and UDP. LAN discovery, login, the UDP join and heartbeat after
+    /// login, chat and the joined/left feed. The receive thread in NetworkClient
+    /// parses and queues; Update() drains the queue on the main thread — the only
+    /// thread allowed to touch Unity. The dev UI is NetworkHud (handed out, module 5):
     /// it only reads the public properties below, listens to the two events and calls
     /// the public methods. Nothing here draws anything.
     /// </summary>
@@ -25,23 +27,37 @@ namespace KnockKnockArena.Networking
         public string Username = "test";
         public string Password = "test";
 
+        // What the HUD shows. Only this class sets them.
         public string StatusLine { get; private set; } = "";
         public string ServerInfoLine { get; private set; } = "";
         public bool IsConnecting { get; private set; }
         public bool IsLoggedIn => _client != null && !IsConnecting;
         public long TcpMessagesSkipped => _client?.TcpMessagesSkipped ?? 0;
+        public bool InGame => _client?.InGame ?? false;
+        public long JoinsSent => _client?.JoinsSent ?? 0;
+        public int HeartbeatsSent => _client?.HeartbeatsSent ?? 0;
 
+        // A chat line and a joined/left line, ready to show.
         public event Action<string> ChatReceived;
         public event Action<string> PlayerFeed;
 
         private NetworkClient _client;
 
+        // Player id -> username, built from PlayerJoined events. The server replays
+        // the roster on login, so players who were already online are covered too.
         private readonly Dictionary<byte, string> _usernames = new Dictionary<byte, string>();
 
         private void Update()
         {
             if (_client != null)
                 DrainTcpMessages();
+
+            // The search thread's result, copied on the main thread for the HUD.
+            lock (_lanGate)
+            {
+                LanServers = _lanResults;
+                LanStatus = _lanStatus;
+            }
         }
 
         // ------------------------------------------------------------- connection
@@ -74,6 +90,65 @@ namespace KnockKnockArena.Networking
             _client?.Dispose();
         }
 
+        // ------------------------------------------------------------- finding servers
+
+        private readonly object _lanGate = new object();
+        private List<DiscoveredServer> _lanResults = new List<DiscoveredServer>();
+        private string _lanStatus = "";
+        private volatile bool _searchingLan;
+
+        // What the HUD shows of the search. Only this class sets them.
+        public IReadOnlyList<DiscoveredServer> LanServers { get; private set; } = new List<DiscoveredServer>();
+        public string LanStatus { get; private set; } = "";
+        public bool IsSearchingLan => _searchingLan;
+
+        /// <summary>
+        /// LAN discovery (M05): broadcast a DiscoveryRequest on the game port and collect
+        /// answers for 2 s. The search blocks, so it runs on a background thread that only
+        /// fills a list — the same rule as the rest of the netcode: that thread never
+        /// touches Unity, the main thread never touches the socket.
+        /// </summary>
+        public void FindLanServers()
+        {
+            int port = Port;
+            _searchingLan = true;
+            lock (_lanGate)
+                _lanStatus = $"Searching the LAN on port {port}...";
+
+            new System.Threading.Thread(() =>
+            {
+                List<DiscoveredServer> found;
+                string status;
+                try
+                {
+                    found = LanDiscovery.Search(port, TimeSpan.FromSeconds(2));
+                    status = $"{found.Count} LAN server(s) answered on port {port}";
+                }
+                catch (Exception ex)
+                {
+                    found = new List<DiscoveredServer>();
+                    status = $"LAN search failed: {ex.Message}";
+                }
+                lock (_lanGate)
+                {
+                    _lanResults = found;
+                    _lanStatus = status;
+                }
+                _searchingLan = false;
+            })
+            {
+                IsBackground = true,
+                Name = "kka-lan-discovery",
+            }.Start();
+        }
+
+        public void JoinLanServer(DiscoveredServer server)
+        {
+            Host = server.Address.ToString();
+            Port = server.Info.GamePort;
+            Connect();
+        }
+
         private void DrainTcpMessages()
         {
             while (_client != null && _client.TcpMessages.TryDequeue(out object message))
@@ -85,9 +160,10 @@ namespace KnockKnockArena.Networking
                         break;
 
                     case LoginResponse login when login.Success:
-                        StatusLine = $"Logged in as player #{login.PlayerId}";
+                        StatusLine = $"Logged in as player #{login.PlayerId}, joining the game over UDP...";
                         IsConnecting = false;
                         _usernames[login.PlayerId] = Username;
+                        _client.StartGame();
                         break;
 
                     case LoginResponse login:
