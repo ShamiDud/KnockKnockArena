@@ -1,0 +1,19 @@
+**/bin/
+**/obj/
+.git/
+.claude/
+docs/
+*.md
+
+# Server data: accounts.json holds password hashes and must never enter an image.
+# Only the game content files are let through.
+data/*
+!data/arena.json
+!data/weapons.json
+!data/pickups.json
+
+# The Unity project is huge (Library/ alone); the server only needs the shared code.
+KnockKnockClient/*
+!KnockKnockClient/Assets
+KnockKnockClient/Assets/*
+!KnockKnockClient/Assets/Shared

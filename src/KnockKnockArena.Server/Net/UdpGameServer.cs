@@ -207,8 +207,8 @@ public sealed class UdpGameServer
         byte[] answer = new DiscoveryResponsePacket
         {
             Nonce = request.Nonce,
-            GamePort = (ushort)_config.Port,
-            // #03 HttpPort skrives her
+            GamePort = (ushort)_config.Port, // #03 GamePort og HttpPort skrives her, i stedet for denne linje
+            HttpPort = (ushort)_config.HttpPort, // #03 GamePort og HttpPort skrives her, i stedet for denne linje
             PlayersOnline = (byte)_sessions.Count,
             MaxPlayers = (byte)_config.MaxPlayers,
             ServerName = _config.ServerName,

@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Threading;
 using KnockKnockArena.Server;
 using KnockKnockArena.Server.Auth;
@@ -86,57 +87,70 @@ RestApi.Start(config, accounts, content, () => new
     playersOnline = server.PlayersOnline,
     playersInGame = world.PlayerCount,
     maxPlayers = config.MaxPlayers,
-    gamePort = config.Port,
-    httpPort = config.HttpPort,
+    gamePort = config.AdvertisedPort,
+    httpPort = config.AdvertisedHttpPort,
     tickRate = KnockKnockArena.Shared.Simulation.GameConstants.TickRate,
     mapName = content.Map.Name,
     mapHash = KnockKnockArena.Shared.Simulation.ArenaMapData.FormatHash(content.Map.Hash),
 });
 
 using ManualResetEventSlim shutdown = new();
+// Ctrl+C (SIGINT) and SIGTERM - what `docker stop` sends - end the server like `quit`:
+// cancel the default "exit now", and let the main thread shut down properly below.
+// docker stop waits 10 s for that, then sends SIGKILL, which no program can catch.
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
     shutdown.Set();
 };
+// #01 SIGTERM skrives her
 
-// Console commands for local debugging.
+// Console commands for local debugging, on their own thread, so a signal can end the
+// server while the console waits for a line. In Docker (detached) stdin yields
+// end-of-input immediately, and the thread simply ends.
 Log.Info("Commands: status | rewind on | rewind off | quit");
-while (!shutdown.IsSet)
+Thread consoleThread = new(() =>
 {
-    string? line = Console.ReadLine();
-    if (line == null)
-        break;
-
-    switch (line.Trim().ToLowerInvariant())
+    while (!shutdown.IsSet)
     {
-        case "status":
-            Log.Info($"version={TcpGameServer.ServerVersion} " +
-                     $"uptime={server.Uptime:hh\\:mm\\:ss} " +
-                     $"players={server.PlayersOnline}/{config.MaxPlayers} " +
-                     $"inGame={world.PlayerCount} tick={world.ServerTick} " +
-                     $"rewind={(world.RewindEnabled ? "on" : "off")}");
-            break;
-        // Lag compensation on and off in one take, no restart (M08).
-        case "rewind on":
-            world.RewindEnabled = true;
-            Log.Info("Rewind is on: shots are judged where the targets were at the tick the shooter saw");
-            break;
-        case "rewind off":
-            world.RewindEnabled = false;
-            Log.Info("Rewind is off: shots are judged where the targets are now");
-            break;
-        case "quit":
-            shutdown.Set();
-            break;
-        case "":
-            break;
-        default:
-            Log.Info("Unknown command. Commands: status | rewind on | rewind off | quit");
-            break;
+        string? line = Console.ReadLine();
+        if (line == null)
+            return;
+
+        switch (line.Trim().ToLowerInvariant())
+        {
+            case "status":
+                Log.Info($"version={TcpGameServer.ServerVersion} " +
+                         $"uptime={server.Uptime:hh\\:mm\\:ss} " +
+                         $"players={server.PlayersOnline}/{config.MaxPlayers} " +
+                         $"inGame={world.PlayerCount} tick={world.ServerTick} " +
+                         $"rewind={(world.RewindEnabled ? "on" : "off")}");
+                break;
+            // Lag compensation on and off in one take, no restart (M08).
+            case "rewind on":
+                world.RewindEnabled = true;
+                Log.Info("Rewind is on: shots are judged where the targets were at the tick the shooter saw");
+                break;
+            case "rewind off":
+                world.RewindEnabled = false;
+                Log.Info("Rewind is off: shots are judged where the targets are now");
+                break;
+            case "quit":
+                shutdown.Set();
+                break;
+            case "":
+                break;
+            default:
+                Log.Info("Unknown command. Commands: status | rewind on | rewind off | quit");
+                break;
+        }
     }
-}
+}) { IsBackground = true, Name = "console" };
+consoleThread.Start();
 
 shutdown.Wait();
+// A proper shutdown: every active player is disconnected through the normal path, so
+// their session's score is put on their account (and saved) before the process exits.
 Log.Info("Shutting down.");
+// #04 kaldet til DisconnectAll skrives her
 return 0;

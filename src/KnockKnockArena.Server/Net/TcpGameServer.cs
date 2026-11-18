@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -55,7 +56,7 @@ public sealed class TcpGameServer
     {
         while (true)
         {
-            TcpClient tcpClient = _listener!.AcceptTcpClient();
+            TcpClient tcpClient = _listener!.AcceptTcpClient(); // #02 try og catch skrives her, i stedet for denne linje
             ClientConnection connection = new(tcpClient);
 
             lock (_clientsGate)
@@ -149,13 +150,13 @@ public sealed class TcpGameServer
         {
             error = "already logged in";
         }
-        else if (request.Username.Length == 0 || request.Password != "test") // #01 Validate skrives her, i stedet for denne linje
+        else if (!_accounts.Validate(request.Username, request.Password, out accountUsername))
         {
             // Module 11: the account's PBKDF2 hash decides - an unknown name and a wrong
             // password get the same answer, so a guess learns nothing about which it was.
             error = "invalid credentials";
         }
-        else if (_sessions.TryCreate(request.Username, out PlayerSession? session, out error)) // #02 accountUsername skrives her, i stedet for denne linje
+        else if (_sessions.TryCreate(accountUsername, out PlayerSession? session, out error))
         {
             connection.Session = session;
 
@@ -254,6 +255,8 @@ public sealed class TcpGameServer
         }
         Log.Info($"SEND {type} ({payload.Length} B) to {sent} client{(sent == 1 ? "" : "s")}");
     }
+
+    // #03 metoden DisconnectAll skrives her
 
     private void Disconnect(ClientConnection connection, string reason)
     {
