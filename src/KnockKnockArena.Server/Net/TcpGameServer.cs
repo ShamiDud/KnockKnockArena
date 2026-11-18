@@ -20,6 +20,7 @@ public sealed class TcpGameServer
 
     private readonly ServerConfig _config;
     private readonly SessionManager _sessions;
+    private readonly AccountStore _accounts;
     private readonly List<ClientConnection> _clients = new();
     private readonly object _clientsGate = new();
     private readonly DateTime _startedUtc = DateTime.UtcNow;
@@ -30,10 +31,11 @@ public sealed class TcpGameServer
     /// wired up to despawn the player from the game world.</summary>
     public event Action<PlayerSession>? PlayerDisconnected;
 
-    public TcpGameServer(ServerConfig config, SessionManager sessions)
+    public TcpGameServer(ServerConfig config, SessionManager sessions, AccountStore accounts)
     {
         _config = config;
         _sessions = sessions;
+        _accounts = accounts;
     }
 
     public TimeSpan Uptime => DateTime.UtcNow - _startedUtc;
@@ -142,16 +144,18 @@ public sealed class TcpGameServer
         LoginRequest request = LoginRequest.FromPayload(payload);
 
         string error;
+        string accountUsername = "";
         if (connection.Session != null)
         {
             error = "already logged in";
         }
-        else if (request.Username.Length == 0 || request.Password != "test")
+        else if (request.Username.Length == 0 || request.Password != "test") // #01 Validate skrives her, i stedet for denne linje
         {
-            // Module 4: any username, one hardcoded password. Real accounts come in M11.
+            // Module 11: the account's PBKDF2 hash decides - an unknown name and a wrong
+            // password get the same answer, so a guess learns nothing about which it was.
             error = "invalid credentials";
         }
-        else if (_sessions.TryCreate(request.Username, out PlayerSession? session, out error))
+        else if (_sessions.TryCreate(request.Username, out PlayerSession? session, out error)) // #02 accountUsername skrives her, i stedet for denne linje
         {
             connection.Session = session;
 
@@ -168,8 +172,8 @@ public sealed class TcpGameServer
                 TickRate = GameConstants.TickRate,
                 MaxPlayers = (byte)_config.MaxPlayers,
                 PlayersOnline = (byte)_sessions.Count,
-                MapName = "",   // no map before M06
-                MapHash = 0,
+                MapName = ArenaMap.Name,
+                MapHash = ArenaMap.Hash,
             }.ToPayload());
 
             Broadcast(MessageType.PlayerJoined, new PlayerJoined
@@ -232,6 +236,7 @@ public sealed class TcpGameServer
         lock (_clientsGate)
             snapshot = _clients.ToArray();
 
+        int sent = 0;
         foreach (ClientConnection client in snapshot)
         {
             if (client == except || client.Session == null)
@@ -239,6 +244,7 @@ public sealed class TcpGameServer
             try
             {
                 client.Send(type, payload);
+                sent++;
             }
             catch
             {
@@ -246,6 +252,7 @@ public sealed class TcpGameServer
                 // and run the disconnect path; nothing more to do here.
             }
         }
+        Log.Info($"SEND {type} ({payload.Length} B) to {sent} client{(sent == 1 ? "" : "s")}");
     }
 
     private void Disconnect(ClientConnection connection, string reason)
@@ -305,5 +312,61 @@ public sealed class TcpGameServer
             // the socket exception the read loop sees.
             Disconnect(target, reason);
         }
+    }
+
+    /// <summary>Kill feed: broadcast a PlayerDied event to every logged-in client.</summary>
+    public void BroadcastPlayerDied(byte killerId, string killerName, byte victimId, string victimName, byte weaponId)
+    {
+        Broadcast(MessageType.PlayerDied, new PlayerDied
+        {
+            KillerId = killerId,
+            KillerUsername = killerName,
+            VictimId = victimId,
+            VictimUsername = victimName,
+            WeaponId = weaponId,
+        }.ToPayload());
+    }
+
+    /// <summary>Broadcast a PickupTaken event to every logged-in client.</summary>
+    public void BroadcastPickupTaken(byte playerId, string username, byte pickupId, byte pickupType)
+    {
+        Broadcast(MessageType.PickupTaken, new PickupTaken
+        {
+            PlayerId = playerId,
+            Username = username,
+            PickupId = pickupId,
+            Type = (Shared.Protocol.Udp.PickupType)pickupType,
+        }.ToPayload());
+    }
+
+    /// <summary>Broadcast a RocketExploded event to every logged-in client.</summary>
+    public void BroadcastRocketExploded(ushort rocketEntityId, float x, float z, byte ownerId)
+    {
+        Broadcast(MessageType.RocketExploded, new RocketExploded
+        {
+            RocketEntityId = rocketEntityId,
+            X = x,
+            Z = z,
+            OwnerId = ownerId,
+        }.ToPayload());
+    }
+
+    /// <summary>
+    /// Announces damage and WHERE it landed. Broadcast, not sent to the victim
+    /// alone: everyone watching a fight should see the blood, not just the person
+    /// bleeding.
+    /// </summary>
+    public void BroadcastPlayerDamaged(byte victimId, float x, float z,
+        byte attackerId, byte weaponId, byte damage)
+    {
+        Broadcast(MessageType.PlayerDamaged, new PlayerDamaged
+        {
+            VictimId = victimId,
+            X = x,
+            Z = z,
+            AttackerId = attackerId,
+            WeaponId = weaponId,
+            Damage = damage,
+        }.ToPayload());
     }
 }

@@ -1,16 +1,36 @@
 using System.Collections.Generic;
+using KnockKnockArena.Shared.Protocol;
+using KnockKnockArena.Gameplay;
 using KnockKnockArena.Shared.Protocol.Udp;
 using UnityEngine;
 
 namespace KnockKnockArena.Networking
 {
     /// <summary>
-    /// Handed out (Moodle), module 5 after implementation 5: the dev UI — connect panel
-    /// with "Find LAN servers" and the list of servers that answered, HUD with the UDP
-    /// join and heartbeat counters, chat and the joined/left feed. It replaces the
-    /// NetworkHud.cs from implementation 4. It only reads NetworkBootstrap's public
-    /// properties, listens to its two events and calls its public methods; it never
-    /// touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
+    /// Handed out (Moodle), module 11 after implementation 3: the dev UI — connect panel
+    /// with the HTTP port row (the REST port /api/config is fetched from) and the
+    /// latency field, "Connect" and "Create account", "Find LAN servers", "Browse",
+    /// "Quick join" and the Browse list row, the account line, and one scrollable list with the LAN servers that answered and the server
+    /// browser's rows (Join only for a compatible server),
+    /// HUD with your HP, the shown weapon and its ammo, frags and deaths, the UDP
+    /// counters (joins, snapshots, snapshots dropped out of order, inputs, heartbeats),
+    /// the prediction line (unacked inputs, reconciliations, bitMismatches, the first
+    /// mismatch), the key line (the prediction, reconciliation and interpolation toggles and the
+    /// latency and jitter sliders are in the settings menu, F1), chat and the feed (joined, left, took a
+    /// pickup, the kills, the rocket explosions), the YOU DIED overlay with the
+    /// respawn countdown, the scoreboard while Tab is held, and the leaderboard while L
+    /// is held. The crosshair, the weapon bar and the status HUD
+    /// (health and ammo in the corners) are not drawn here: they are the base
+    /// project's components, fed by NetworkBootstrap. New in module 11: the
+    /// Create account button (on its own row with Connect), the account line under
+    /// the server list, the leaderboard box, "L leaderboard" in the key line, and the
+    /// L key that fetches the leaderboard once per press; the connect panel is 535
+    /// pixels tall and the HUD block 860 wide. It replaces the NetworkHud.cs from
+    /// module 10, implementation 5.
+    /// It only reads NetworkBootstrap's public properties, sets its
+    /// connect fields (HttpPort and ServerBrowserList among them), SimulatedLatencyMs, SimulatedJitterMs, EnablePrediction,
+    /// EnableReconciliation, EnableInterpolation and IsTyping, listens
+    /// to its two events and calls its public methods; it never touches the network. Put it in Assets/Scripts/Networking next to NetworkBootstrap.
     /// It adds itself to the NetworkBootstrap object when the scene starts, so nothing in
     /// the scene changes.
     /// </summary>
@@ -42,6 +62,8 @@ namespace KnockKnockArena.Networking
             _net = GetComponent<NetworkBootstrap>();
             _net.ChatReceived += AddChatLine;
             _net.PlayerFeed += AddFeedLine;
+            GameMenu.Sections += DrawSettingsSections;
+            _showStats = PlayerPrefs.GetInt("kka.ui.stats", 1) == 1;
         }
 
         private void OnDestroy()
@@ -50,19 +72,35 @@ namespace KnockKnockArena.Networking
                 return;
             _net.ChatReceived -= AddChatLine;
             _net.PlayerFeed -= AddFeedLine;
+            GameMenu.Sections -= DrawSettingsSections;
         }
 
         private void Update()
         {
             _feed.RemoveAll(entry => Time.time - entry.Time > 6f);
 
+            // The open chat line or the settings menu (F1) takes the keys and the clicks, so NetworkBootstrap stops
+            // moving the player, and a click on a slider in the menu is not a shot.
+            _net.IsTyping = _chatOpen || GameMenu.Open;
+
+            // Leaderboard: fetched once per press, shown while L is held.
+            if (!_net.IsTyping && _net.InGame && Input.GetKeyDown(KeyCode.L))
+                _net.StartFetchLeaderboard();
+
             // A dropped connection closes the chat line.
             if (!_net.IsLoggedIn && _chatOpen)
             {
-                _chatOpen = false;
+                SetChatOpen(false);
                 _chatFocusRequested = false;
                 _chatInput = "";
             }
+        }
+
+        // The open chat line takes the keys, so NetworkBootstrap stops moving the player.
+        private void SetChatOpen(bool open)
+        {
+            _chatOpen = open;
+            _net.IsTyping = open;
         }
 
         private void AddChatLine(string line)
@@ -81,10 +119,10 @@ namespace KnockKnockArena.Networking
 
         private void OnGUI()
         {
-            // Black text throughout the dev UI. The default skin draws light text,
-            // which disappears against this map's bright ground — and this HUD gets
-            // read off a recording, where it has to survive video compression too.
-            GUI.contentColor = Color.black;
+            // White text throughout the dev UI, and every panel on a dark backdrop
+            // (HudPanel), since this map's ground is bright: white on dark reads in-game and
+            // survives video compression on a recording.
+            GUI.contentColor = Color.white;
 
             if (!_net.IsLoggedIn)
             {
@@ -94,16 +132,23 @@ namespace KnockKnockArena.Networking
 
             HandleChatKeys();
 
-            DrawHud();
+            if (_showStats)
+                DrawHud();
+            else
+                DrawKeyHint();
+            DrawDeathOverlay();
             DrawChat();
             DrawFeed();
+            if (Input.GetKey(KeyCode.Tab) && _net.InGame)
+                DrawScoreboard();
+            if (!_net.IsTyping && _net.InGame && Input.GetKey(KeyCode.L))
+                DrawLeaderboard();
         }
 
         private void DrawConnectPanel()
         {
-            // Solid black panel with white text: the default box is see-through, and
-            // the rest of the dev UI draws black text for the in-game overlay.
-            Rect panel = new Rect(20, 20, 400, 360);
+            // Solid black panel with white text: the default box is see-through.
+            Rect panel = new Rect(20, 20, 400, 535);
             Color previousColor = GUI.color;
             Color previousContent = GUI.contentColor;
             GUI.color = Color.black;
@@ -122,6 +167,10 @@ namespace KnockKnockArena.Networking
             int.TryParse(GUILayout.TextField(_net.Port.ToString()), out _net.Port);
             GUILayout.EndHorizontal();
             GUILayout.BeginHorizontal();
+            GUILayout.Label("HTTP port", GUILayout.Width(70));
+            int.TryParse(GUILayout.TextField(_net.HttpPort.ToString()), out _net.HttpPort);
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
             GUILayout.Label("User", GUILayout.Width(70));
             _net.Username = GUILayout.TextField(_net.Username);
             GUILayout.EndHorizontal();
@@ -129,18 +178,40 @@ namespace KnockKnockArena.Networking
             GUILayout.Label("Password", GUILayout.Width(70));
             _net.Password = GUILayout.PasswordField(_net.Password, '*');
             GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Latency ms", GUILayout.Width(70));
+            int.TryParse(GUILayout.TextField(_net.SimulatedLatencyMs.ToString()), out _net.SimulatedLatencyMs);
+            GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
-            GUI.enabled = !_net.IsConnecting;
+            GUI.enabled = !_net.IsConnecting && !_net.IsCreatingAccount;
             if (GUILayout.Button("Connect"))
                 _net.Connect();
+            if (GUILayout.Button("Create account"))
+                _net.StartCreateAccount();
+            GUI.enabled = true;
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(6);
+            GUILayout.BeginHorizontal();
             GUI.enabled = !_net.IsConnecting && !_net.IsSearchingLan;
             if (GUILayout.Button("Find LAN servers"))
                 _net.FindLanServers();
+            GUI.enabled = !_net.IsConnecting && !_net.IsBrowsing;
+            if (GUILayout.Button("Browse"))
+                _net.StartBrowse();
+            if (GUILayout.Button("Quick join"))
+                _net.StartQuickJoin();
             GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Browse list", GUILayout.Width(70));
+            _net.ServerBrowserList = GUILayout.TextField(_net.ServerBrowserList);
             GUILayout.EndHorizontal();
             DrawServerList();
 
+            if (_net.AccountStatus.Length > 0)
+                GUILayout.Label(_net.AccountStatus);
             GUILayout.Label(_net.StatusLine);
             GUILayout.EndArea();
             GUI.contentColor = previousContent;
@@ -148,11 +219,12 @@ namespace KnockKnockArena.Networking
 
         private void DrawServerList()
         {
-            if (_net.LanStatus.Length == 0)
+            if (_net.LanStatus.Length == 0 && _net.BrowserStatus.Length == 0)
                 return;
 
-            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(120));
-            GUILayout.Label(_net.LanStatus);
+            _serverListScroll = GUILayout.BeginScrollView(_serverListScroll, GUILayout.Height(150));
+            if (_net.LanStatus.Length > 0)
+                GUILayout.Label(_net.LanStatus);
             foreach (DiscoveredServer server in _net.LanServers)
             {
                 GUILayout.BeginHorizontal();
@@ -164,22 +236,246 @@ namespace KnockKnockArena.Networking
                 {
                     GUILayout.Label($"{server.Info.ServerName}  {server.Info.PlayersOnline}/{server.Info.MaxPlayers}");
                     GUI.enabled = !_net.IsConnecting;
+                    // The discovery answer carries the REST port too: the config
+                    // lookup needs it before the game port is touched.
                     if (GUILayout.Button("Join", GUILayout.Width(50)))
-                        _net.JoinLanServer(server);
+                        _net.JoinServer(server.Address.ToString(), server.Info.GamePort, server.Info.HttpPort);
                     GUI.enabled = true;
                 }
                 GUILayout.EndHorizontal();
             }
+            DrawBrowserRows();
             GUILayout.EndScrollView();
         }
 
+        /// <summary>The browser's rows in the server list: one per listed entry, with
+        /// Join only for a server that speaks our protocol version.</summary>
+        private void DrawBrowserRows()
+        {
+            if (_net.BrowserStatus.Length > 0)
+                GUILayout.Label(_net.BrowserStatus);
+            foreach (NetworkBootstrap.BrowserEntry entry in _net.BrowserResults)
+            {
+                GUILayout.BeginHorizontal();
+                if (entry.Status == null)
+                {
+                    GUILayout.Label($"{entry.Label}: {entry.Error}");
+                }
+                else
+                {
+                    ServerStatus status = entry.Status;
+                    GUILayout.Label($"{status.ServerName}  {status.PlayersOnline}/{status.MaxPlayers}  \"{status.MapName}\"" +
+                                    (status.Compatible ? "" : $"  v{status.ProtocolVersion} (incompatible)"));
+                    GUI.enabled = !_net.IsConnecting && status.Compatible;
+                    if (GUILayout.Button("Join", GUILayout.Width(50)))
+                        _net.JoinServer(entry.Host, status.GamePort, status.HttpPort);
+                    GUI.enabled = true;
+                }
+                GUILayout.EndHorizontal();
+            }
+        }
+
+        // The counters change every frame. In a font where every character is equally wide, and with a fixed width
+        // per number, the text around them stays still, so the HUD can be read while playing.
+        private GUIStyle _counters;
+        private GUIStyle Counters => _counters ??= new GUIStyle(GUI.skin.label)
+        {
+            font = Font.CreateDynamicFontFromOSFont(new[] { "Consolas", "Courier New" }, 14),
+        };
+
         private void DrawHud()
         {
-            GUILayout.BeginArea(new Rect(20, 20, 780, 100));
-            GUILayout.Label(_net.InGame ? "In the game (UDP)" : _net.StatusLine);
-            GUILayout.Label($"UDP: joins sent={_net.JoinsSent}  heartbeats={_net.HeartbeatsSent}");
+            GUILayout.BeginArea(new Rect(20, 20, 860, 160));
+            GUILayout.BeginVertical(HudPanel);
+            GUILayout.Label(!_net.InGame ? _net.StatusLine
+                : !_net.HasOwnState ? "In the game (UDP)"
+                : $"In the game (UDP)  |  HP {_net.Health}  |  {_net.DisplayedWeapon} ({_net.Ammo} ammo)  |  " +
+                  $"frags {_net.Frags}  deaths {_net.Deaths}");
+            GUILayout.Label($"UDP: joins sent={_net.JoinsSent,3}  snapshots={_net.SnapshotsAccepted,7}  " +
+                            $"dropped (out of order)={_net.SnapshotsDropped,5}  " +
+                            $"inputs sent={_net.InputsSent,7}  heartbeats={_net.HeartbeatsSent,4}", Counters);
             GUILayout.Label($"{_net.ServerInfoLine}  |  unknown TCP messages skipped: {_net.TcpMessagesSkipped}");
-            GUILayout.Label("Enter chat");
+            GUILayout.Label($"prediction: unacked={_net.UnackedInputs,3}  reconciliations={_net.Reconciliations,7}  " +
+                            $"bitMismatches={_net.BitMismatches,4}", Counters);
+            GUILayout.Label("F1 settings  |  WASD move  |  Shift sprint  |  Ctrl walk  |  Space dash  |  mouse fire  |  1-4 weapons  |  Enter chat  |  Tab scoreboard  |  L leaderboard");
+            if (_net.FirstMismatch.Length > 0)
+                GUILayout.Label($"FIRST MISMATCH: {_net.FirstMismatch}");
+            GUILayout.EndVertical();
+            GUILayout.EndArea();
+        }
+
+        /// <summary>
+        /// The netcode techniques plus the latency simulator, switchable WHILE PLAYING
+        /// so one unbroken take can show what each of them is doing. The controls only
+        /// set NetworkBootstrap's fields; NetworkBootstrap pushes the latency and the
+        /// jitter into the client every frame — no reconnect needed.
+        /// </summary>
+        private void DrawTechniqueToggles()
+        {
+            GUILayout.Label("Netcode");
+            GUILayout.BeginHorizontal();
+            _net.EnablePrediction = GUILayout.Toggle(_net.EnablePrediction, " prediction", GUILayout.Width(110));
+            _net.EnableReconciliation = GUILayout.Toggle(_net.EnableReconciliation, " reconciliation", GUILayout.Width(125));
+            _net.EnableInterpolation = GUILayout.Toggle(_net.EnableInterpolation, " interpolation", GUILayout.Width(120));
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"   latency {_net.SimulatedLatencyMs} ms/way", GUILayout.Width(160));
+            _net.SimulatedLatencyMs = Mathf.RoundToInt(
+                GameMenu.MenuSlider(_net.SimulatedLatencyMs, 0f, 300f, GUILayout.Width(200)));
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"   jitter ±{_net.SimulatedJitterMs} ms", GUILayout.Width(160));
+            _net.SimulatedJitterMs = Mathf.RoundToInt(
+                GameMenu.MenuSlider(_net.SimulatedJitterMs, 0f, 100f, GUILayout.Width(200)));
+            GUILayout.EndHorizontal();
+        }
+
+        // ------------------------------------------------------------- settings menu (F1)
+
+        // The stats panel (top left) can be hidden from the menu; kept between runs (read in Awake:
+        // Unity does not allow PlayerPrefs in a MonoBehaviour's field initializers).
+        private bool _showStats = true;
+
+        // with the stats hidden: only the keys, so F1 can still be found
+        private void DrawKeyHint()
+        {
+            GUILayout.BeginArea(new Rect(20, 20, 780, 60));
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("F1 settings  |  Tab scoreboard  |  L leaderboard  |  Enter chat", HudPanel);
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+            GUILayout.EndArea();
+        }
+
+        /// <summary>
+        /// This HUD's sections in the settings menu (GameMenu, F1), above its sound section: the
+        /// stats on or off and the netcode techniques with the latency simulator. While the menu is
+        /// open the game takes no input (IsTyping, set in Update).
+        /// </summary>
+        private void DrawSettingsSections()
+        {
+            bool showStats = GUILayout.Toggle(_showStats, " Show stats (top left: connection, inputs, prediction)");
+            if (showStats != _showStats)
+            {
+                _showStats = showStats;
+                PlayerPrefs.SetInt("kka.ui.stats", showStats ? 1 : 0);
+                PlayerPrefs.Save();
+            }
+            GUILayout.Space(10);
+            DrawTechniqueToggles();
+        }
+
+        // A dark, half see-through backdrop that fits its content: the default box is too light
+        // behind white text on this map.
+        private GUIStyle _hudPanel;
+        private GUIStyle HudPanel
+        {
+            get
+            {
+                if (_hudPanel != null)
+                    return _hudPanel;
+                Texture2D dark = new Texture2D(1, 1);
+                dark.SetPixel(0, 0, new Color(0f, 0f, 0f, 0.65f));
+                dark.Apply();
+                _hudPanel = new GUIStyle(GUI.skin.box) { padding = new RectOffset(8, 8, 6, 6) };
+                _hudPanel.normal.background = dark;
+                return _hudPanel;
+            }
+        }
+
+        private GUIStyle _deathStyle;
+
+        /// <summary>Big centered death overlay: the respawn countdown and prompt need
+        /// to be unmissable, not buried in the debug block. Respawn is "press fire"
+        /// (Quake style) — a held or fresh click after the delay respawns.</summary>
+        private void DrawDeathOverlay()
+        {
+            if (!_net.IsDead)
+                return;
+
+            if (_deathStyle == null)
+            {
+                _deathStyle = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 34,
+                    fontStyle = FontStyle.Bold,
+                    alignment = TextAnchor.MiddleCenter,
+                };
+            }
+
+            float wait = _net.RespawnSecondsLeft;
+            string line2 = wait > 0f
+                ? $"respawn in {wait:F1} s"
+                : "CLICK (fire) TO RESPAWN";
+            GUI.Box(new Rect(Screen.width / 2f - 220f, Screen.height * 0.35f - 6f, 440f, 88f), GUIContent.none, HudPanel);
+            GUI.Label(new Rect(0, Screen.height * 0.35f, Screen.width, 50), "YOU DIED", _deathStyle);
+            GUI.Label(new Rect(0, Screen.height * 0.35f + 46, Screen.width, 30), line2,
+                new GUIStyle(_deathStyle) { fontSize = 20, fontStyle = FontStyle.Normal });
+        }
+
+        /// <summary>Hold Tab: this session's frags and deaths, straight from the newest
+        /// snapshot — every player entity carries its own score.</summary>
+        private void DrawScoreboard()
+        {
+            IReadOnlyList<PlayerEntityState> players = _net.ScoreboardPlayers;
+            const float width = 420f;
+            float height = 60f + players.Count * 24f;
+            GUILayout.BeginArea(new Rect((Screen.width - width) / 2f, 80f, width, height), HudPanel);
+            GUILayout.Label("SCOREBOARD (session)");
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Player", GUILayout.Width(180));
+            GUILayout.Label("Frags", GUILayout.Width(60));
+            GUILayout.Label("Deaths", GUILayout.Width(60));
+            GUILayout.Label("HP", GUILayout.Width(80));
+            GUILayout.EndHorizontal();
+
+            List<PlayerEntityState> sorted = new List<PlayerEntityState>(players);
+            sorted.Sort((a, b) => b.Frags != a.Frags ? b.Frags.CompareTo(a.Frags) : a.Deaths.CompareTo(b.Deaths));
+
+            foreach (PlayerEntityState player in sorted)
+            {
+                string name = _net.Usernames.TryGetValue((byte)player.EntityId, out string known)
+                    ? known
+                    : $"player {player.EntityId}";
+                if (player.EntityId == _net.LocalPlayerId)
+                    name += " (you)";
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(name, GUILayout.Width(180));
+                GUILayout.Label(player.Frags.ToString(), GUILayout.Width(60));
+                GUILayout.Label(player.Deaths.ToString(), GUILayout.Width(60));
+                GUILayout.Label(player.State == PlayerLifeState.Dead ? "DEAD" : player.Health.ToString(),
+                    GUILayout.Width(80));
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndArea();
+        }
+
+        /// <summary>Hold L: the account totals from GET /api/leaderboard — every
+        /// session, not just this one. Frags and deaths of the match in progress are
+        /// not in it yet: the server adds them to the account at disconnect.</summary>
+        private void DrawLeaderboard()
+        {
+            IReadOnlyList<NetworkBootstrap.LeaderboardEntry> entries = _net.LeaderboardEntries;
+            const float width = 420f;
+            float height = 84f + entries.Count * 24f;
+            GUILayout.BeginArea(new Rect((Screen.width - width) / 2f, 80f, width, height), HudPanel);
+            GUILayout.Label("LEADERBOARD (REST, alle sessioner)");
+            GUILayout.Label(_net.LeaderboardStatus);
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Player", GUILayout.Width(180));
+            GUILayout.Label("Frags", GUILayout.Width(60));
+            GUILayout.Label("Deaths", GUILayout.Width(60));
+            GUILayout.Label("K/D", GUILayout.Width(60));
+            GUILayout.EndHorizontal();
+            foreach (NetworkBootstrap.LeaderboardEntry entry in entries)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(entry.username, GUILayout.Width(180));
+                GUILayout.Label(entry.frags.ToString(), GUILayout.Width(60));
+                GUILayout.Label(entry.deaths.ToString(), GUILayout.Width(60));
+                GUILayout.Label(entry.kd.ToString("F2"), GUILayout.Width(60));
+                GUILayout.EndHorizontal();
+            }
             GUILayout.EndArea();
         }
 
@@ -193,7 +489,7 @@ namespace KnockKnockArena.Networking
             {
                 if (!_chatOpen)
                 {
-                    _chatOpen = true;
+                    SetChatOpen(true);
                     _chatFocusRequested = true;
                 }
                 else
@@ -201,7 +497,7 @@ namespace KnockKnockArena.Networking
                     if (!string.IsNullOrWhiteSpace(_chatInput))
                         _net.SendChat(_chatInput.Trim());
                     _chatInput = "";
-                    _chatOpen = false;
+                    SetChatOpen(false);
                     GUIUtility.keyboardControl = 0;
                 }
                 current.Use();
@@ -209,7 +505,7 @@ namespace KnockKnockArena.Networking
             else if (current.keyCode == KeyCode.Escape && _chatOpen)
             {
                 _chatInput = "";
-                _chatOpen = false;
+                SetChatOpen(false);
                 GUIUtility.keyboardControl = 0;
                 current.Use();
             }
@@ -217,7 +513,7 @@ namespace KnockKnockArena.Networking
 
         private void DrawChat()
         {
-            GUILayout.BeginArea(new Rect(20, Screen.height - 240, 420, 220), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(20, Screen.height - 240, 420, 220), HudPanel);
             foreach (string line in _chatLog)
                 GUILayout.Label(line);
             GUILayout.FlexibleSpace();
@@ -241,9 +537,13 @@ namespace KnockKnockArena.Networking
 
         private void DrawFeed()
         {
+            if (_feed.Count == 0)
+                return;
             GUILayout.BeginArea(new Rect(Screen.width - 380, 20, 360, 160));
+            GUILayout.BeginVertical(HudPanel);
             foreach ((string text, float _) in _feed)
                 GUILayout.Label(text);
+            GUILayout.EndVertical();
             GUILayout.EndArea();
         }
     }

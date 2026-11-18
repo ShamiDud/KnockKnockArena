@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using KnockKnockArena.Shared.Protocol;
 using KnockKnockArena.Shared.Protocol.Messages;
 using KnockKnockArena.Shared.Protocol.Udp;
@@ -20,11 +21,12 @@ namespace KnockKnockArena.Networking
 
     /// <summary>
     /// The connection to the game server: TCP (login, chat, events) and UDP (join,
-    /// heartbeat). Pure C# — no Unity API anywhere in this class.
+    /// inputs, snapshots). Pure C# — no Unity API anywhere in this class.
     ///
     /// Threading model (the pattern from T04/T05, exemplary on purpose):
     /// blocking receives run on background threads, which ONLY parse and enqueue.
-    /// The Unity side drains <see cref="TcpMessages"/> from Update() on the main thread.
+    /// The Unity side drains <see cref="TcpMessages"/> and polls
+    /// <see cref="TryTakeSnapshot"/> from Update() on the main thread.
     /// </summary>
     public sealed class NetworkClient : IDisposable
     {
@@ -32,20 +34,65 @@ namespace KnockKnockArena.Networking
         /// Drained on the Unity main thread.</summary>
         public readonly ConcurrentQueue<object> TcpMessages = new ConcurrentQueue<object>();
 
+        /// <summary>Other players' shots (ShotsFired over UDP), for the main thread to
+        /// draw. Cosmetic: a lost packet costs one tracer, nothing else.</summary>
+        public readonly ConcurrentQueue<ShotsFiredPacket> ShotEvents = new ConcurrentQueue<ShotsFiredPacket>();
+
+        /// <summary>Delay applied to all UDP traffic in BOTH directions (so the round
+        /// trip is twice this). Makes latency problems visible on localhost.</summary>
+        public int SimulatedLatencyMs;
+
+        /// <summary>Random variation added to the simulated latency, per datagram and
+        /// direction: each one is delayed latency ± up to this many ms. Uneven gaps are
+        /// what the interpolation buffer smooths out (M07) — and datagrams can overtake
+        /// each other, which the snapshot sequence check then drops.</summary>
+        public int SimulatedJitterMs;
+
+        private readonly Random _jitterRandom = new Random();
+        private readonly object _jitterGate = new object();
+
         public byte PlayerId { get; private set; }
 
-        /// <summary>True once the join phase is over and the heartbeat has taken over.</summary>
+        /// <summary>True once the first snapshot has arrived (= the UDP join succeeded).</summary>
         public bool InGame => _inGame;
+
+        /// <summary>
+        /// The server tick the player is LOOKING AT (M08): other players are drawn
+        /// this far in the past (interpolation, M07), so this is the picture a shot is
+        /// aimed at. Set every frame by the bootstrap from its render clock and sent in
+        /// every input, so lag compensation rewinds to what the shooter actually saw.
+        /// 0 = not known yet: the newest snapshot's tick is sent instead.
+        /// </summary>
+        public uint ViewTick;
+
+        /// <summary>Input packets sent so far (the index of the newest one).</summary>
+        public uint InputIndex => _inputIndex;
 
         // Diagnostics (read from the main thread for the HUD).
         public long TcpMessagesSkipped;
         public long JoinsSent;
+        public long UdpDatagramsReceived;
+        public long SnapshotsAccepted;
+
+        /// <summary>Snapshots thrown away by the sequence check: older than (or a copy
+        /// of) the newest one already taken. Jitter reorders datagrams; this counts it.</summary>
+        public long SnapshotsDropped;
+        public long UdpParseErrors;
+        public long UdpForeignSourceDrops;
+        public volatile string UdpLastForeignSource = "";
+        public volatile string UdpLastError = "";
+
+        private readonly object _snapshotGate = new object();
+        private SnapshotPacket? _latestSnapshot;
+        private bool _snapshotIsNew;
+        private uint _newestSequence;
 
         private TcpClient? _tcp;
         private NetworkStream? _tcpStream;
         private UdpClient? _udp;
         private IPEndPoint? _serverEndPoint;
         private byte[] _sessionToken = Array.Empty<byte>();
+        private uint _inputIndex;
         private IPAddress _serverAddress = IPAddress.None;
         private int _port;
         private volatile bool _running = true;
@@ -125,6 +172,18 @@ namespace KnockKnockArena.Networking
                         case MessageType.PlayerLeft:
                             TcpMessages.Enqueue(PlayerLeft.FromPayload(payload));
                             break;
+                        case MessageType.PlayerDied:
+                            TcpMessages.Enqueue(PlayerDied.FromPayload(payload));
+                            break;
+                        case MessageType.PickupTaken:
+                            TcpMessages.Enqueue(PickupTaken.FromPayload(payload));
+                            break;
+                        case MessageType.RocketExploded:
+                            TcpMessages.Enqueue(RocketExploded.FromPayload(payload));
+                            break;
+                        case MessageType.PlayerDamaged:
+                            TcpMessages.Enqueue(PlayerDamaged.FromPayload(payload));
+                            break;
                         default:
                             // Unknown types are skipped: framing already consumed the
                             // payload, so the stream stays in sync. Counted, so the HUD
@@ -151,8 +210,9 @@ namespace KnockKnockArena.Networking
         }
 
         /// <summary>
-        /// Starts the UDP side after a successful login: a join thread that sends the
-        /// session token, then a heartbeat thread that keeps the session alive.
+        /// Starts the UDP side after a successful login: receive thread + a join loop
+        /// that resends the session token every 0.5 s until the first snapshot lands
+        /// (there is no join-ack — snapshots ARE the confirmation).
         /// </summary>
         public void StartGame()
         {
@@ -160,7 +220,7 @@ namespace KnockKnockArena.Networking
             // explicitly resolved IPv4 server address. UdpClient.Connect() installs
             // an OS-level source filter, and subtle address-family differences
             // (dual-mode sockets, "localhost" -> ::1) make replies vanish silently
-            // on some runtimes.
+            // on some runtimes. We filter by source ourselves — visibly (counter).
             _serverEndPoint = new IPEndPoint(_serverAddress, _port);
             _udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
 
@@ -174,23 +234,28 @@ namespace KnockKnockArena.Networking
             }
             catch
             {
-                // Ignored: nothing is received on this socket before M06.
+                // Ignored: the receive loop also tolerates the exception.
             }
+
+            Thread udpReceiveThread = new Thread(ReceiveUdpLoop)
+            {
+                IsBackground = true,
+                Name = "kka-udp",
+            };
+            udpReceiveThread.Start();
 
             byte[] joinDatagram = new JoinPacket { SessionToken = _sessionToken }.ToDatagram();
             Thread joinThread = new Thread(() =>
             {
-                // Module 5: the server sends no snapshots yet, so nothing confirms the
-                // join. Send it JoinAttempts times (one lost datagram is survivable),
-                // then assume we are in and let the heartbeat take over. From M06 the
-                // first snapshot is the confirmation, and the loop runs until it lands.
-                for (int i = 0; i < JoinAttempts && _running; i++)
+                // Module 6 replaces M05's guess ("send 4 joins and assume we are in"):
+                // the server now answers every tick with a snapshot, so the first one
+                // IS the confirmation. Resend until it lands - however many that takes.
+                while (_running && !_inGame)
                 {
                     UdpSend(joinDatagram);
                     Interlocked.Increment(ref JoinsSent);
                     Thread.Sleep(500);
                 }
-                _inGame = true;
             })
             {
                 IsBackground = true,
@@ -206,17 +271,140 @@ namespace KnockKnockArena.Networking
             heartbeatThread.Start();
         }
 
-        /// <summary>Joins sent before the heartbeat takes over (Module 5 only).</summary>
-        private const int JoinAttempts = 4;
+        private void ReceiveUdpLoop()
+        {
+            IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+            try
+            {
+                while (_running)
+                {
+                    byte[] datagram;
+                    try
+                    {
+                        datagram = _udp!.Receive(ref remote);
+                    }
+                    catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException)
+                    {
+                        if (!_running)
+                            break;
+                        continue;
+                    }
+
+                    Interlocked.Increment(ref UdpDatagramsReceived);
+
+                    // Only the game server may talk to us on this socket.
+                    if (!remote.Address.Equals(_serverEndPoint!.Address) || remote.Port != _serverEndPoint.Port)
+                    {
+                        Interlocked.Increment(ref UdpForeignSourceDrops);
+                        UdpLastForeignSource = $"{remote} (expected {_serverEndPoint})";
+                        continue;
+                    }
+
+                    int delayMs = SimulatedDelayMs();
+                    if (delayMs <= 0)
+                        HandleDatagram(datagram);
+                    else
+                        Task.Delay(delayMs).ContinueWith(_ => HandleDatagram(datagram));
+                }
+            }
+            catch (Exception ex)
+            {
+                // Anything unexpected must be VISIBLE, not a silently dead thread.
+                UdpLastError = ex.GetType().Name + ": " + ex.Message;
+            }
+        }
+
+        private void HandleDatagram(byte[] datagram)
+        {
+            try
+            {
+                UdpPacketType type = UdpPacketIO.PeekType(datagram);
+                if (type == UdpPacketType.ShotsFired)
+                {
+                    ShotEvents.Enqueue(ShotsFiredPacket.FromDatagram(datagram));
+                    return;
+                }
+                if (type != UdpPacketType.Snapshot)
+                    return;
+
+                SnapshotPacket snapshot = SnapshotPacket.FromDatagram(datagram);
+                lock (_snapshotGate)
+                {
+                    // Sequence check: drop duplicates and out-of-order.
+                    if (snapshot.Sequence <= _newestSequence)
+                    {
+                        Interlocked.Increment(ref SnapshotsDropped);
+                        return;
+                    }
+                    _newestSequence = snapshot.Sequence;
+                    _latestSnapshot = snapshot;
+                    _snapshotIsNew = true;
+                }
+                _inGame = true;
+                Interlocked.Increment(ref SnapshotsAccepted);
+            }
+            catch (ProtocolException)
+            {
+                // Malformed datagram: drop it; the next snapshot is 33 ms away.
+                Interlocked.Increment(ref UdpParseErrors);
+            }
+        }
+
+        /// <summary>Hands out the newest snapshot once (returns false until a NEW one
+        /// has arrived since the last call). Polled from Update().</summary>
+        public bool TryTakeSnapshot(out SnapshotPacket snapshot)
+        {
+            lock (_snapshotGate)
+            {
+                if (!_snapshotIsNew)
+                {
+                    snapshot = null!;
+                    return false;
+                }
+                _snapshotIsNew = false;
+                snapshot = _latestSnapshot!;
+                return true;
+            }
+        }
+
+        /// <summary>Sends one input packet and returns its index (the prediction
+        /// layer records it for replay). Called at the fixed tick rate by the input
+        /// sampler. Every input also resets the heartbeat timer, so while you are
+        /// playing the heartbeat never needs to send anything — see
+        /// <see cref="HeartbeatLoop"/> for the gaps it covers.</summary>
+        public uint SendInput(MovementBits movement, float aimX, float aimZ, ButtonBits buttons, byte weaponId)
+        {
+            uint tickEstimate = ViewTick;
+            if (tickEstimate == 0)
+            {
+                lock (_snapshotGate)
+                    tickEstimate = _latestSnapshot?.ServerTick ?? 0;
+            }
+
+            uint index = ++_inputIndex;
+            UdpSend(new InputPacket
+            {
+                PlayerId = PlayerId,
+                InputIndex = index,
+                Tick = tickEstimate,
+                Movement = movement,
+                AimX = aimX,
+                AimZ = aimZ,
+                Buttons = buttons,
+                WeaponId = weaponId,
+            }.ToDatagram());
+            return index;
+        }
 
         /// <summary>
         /// Keeps the session alive when there is nothing else to send.
         ///
-        /// The server cannot tell "quiet" from "gone" — UDP has no connection to lose —
-        /// so without a sign of life it drops you after UdpTimeoutSeconds. In Module 5
-        /// the heartbeat is all the client sends once it has joined; from M06 inputs go
-        /// out 30 times a second and reset the timer, and the heartbeat only fills the
-        /// gaps (menu, death, chat).
+        /// While the game loop is running, inputs go out 30 times a second and any
+        /// packet resets the server's timeout, so this never fires. It earns its keep
+        /// in the gaps: the player sitting in a menu, a dead player waiting to
+        /// respawn, a window that lost focus. The server cannot tell "quiet" from
+        /// "gone" — UDP has no connection to lose — so without a sign of life it
+        /// drops you after UdpTimeoutSeconds.
         ///
         /// It runs on its OWN thread rather than out of the game loop, because the
         /// cases it exists for are exactly the ones where the game loop is not
@@ -233,7 +421,7 @@ namespace KnockKnockArena.Networking
 
                 double quietMs = (DateTime.UtcNow - LastUdpSendUtc).TotalMilliseconds;
                 if (quietMs < HeartbeatIntervalMs)
-                    continue; // something went out recently; nothing to do
+                    continue; // inputs are flowing; nothing to do
 
                 UdpSend(new HeartbeatPacket { PlayerId = PlayerId }.ToDatagram());
                 Interlocked.Increment(ref HeartbeatsSent);
@@ -246,11 +434,12 @@ namespace KnockKnockArena.Networking
 
         private const int HeartbeatCheckIntervalMs = 200;
 
-        /// <summary>When we last put a packet on the wire — joins and heartbeats both
-        /// count, because the server's timeout counts them all.</summary>
+        /// <summary>When we last put a packet on the wire — inputs, joins and
+        /// heartbeats all count, because the server's timeout counts them all.</summary>
         public DateTime LastUdpSendUtc { get; private set; } = DateTime.UtcNow;
 
-        /// <summary>Shown in the dev HUD.</summary>
+        /// <summary>Shown in the dev HUD: stays at 0 while you are playing and starts
+        /// climbing the moment the game goes quiet. That contrast is the point.</summary>
         public int HeartbeatsSent;
 
         private void UdpSend(byte[] datagram)
@@ -260,9 +449,39 @@ namespace KnockKnockArena.Networking
             if (udp == null || server == null)
                 return;
 
+            // Stamped at the SEND CALL, not after the simulated-latency delay: the
+            // heartbeat asks "have I got anything in flight", and a packet sitting in
+            // the latency simulator is in flight.
             LastUdpSendUtc = DateTime.UtcNow;
-            try { udp.Send(datagram, datagram.Length, server); }
-            catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException) { }
+
+            int delayMs = SimulatedDelayMs();
+            if (delayMs <= 0)
+            {
+                try { udp.Send(datagram, datagram.Length, server); }
+                catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException) { }
+                return;
+            }
+
+            Task.Delay(delayMs).ContinueWith(_ =>
+            {
+                try { udp.Send(datagram, datagram.Length, server); }
+                catch (Exception ex) when (ex is SocketException || ex is ObjectDisposedException) { }
+            });
+        }
+
+        /// <summary>This datagram's simulated delay: the latency plus a random jitter in
+        /// [-SimulatedJitterMs, +SimulatedJitterMs], never below 0. Called from the receive
+        /// thread and the main thread, hence the lock around the shared Random.</summary>
+        private int SimulatedDelayMs()
+        {
+            int latency = SimulatedLatencyMs;
+            int jitter = SimulatedJitterMs;
+            if (jitter <= 0)
+                return latency;
+            int offset;
+            lock (_jitterGate)
+                offset = _jitterRandom.Next(-jitter, jitter + 1);
+            return Math.Max(0, latency + offset);
         }
 
         public void Dispose()

@@ -9,10 +9,13 @@ namespace KnockKnockArena.Shared.Protocol.Udp
     {
         // Client -> server
         Join = 0,
+        Input = 1,
         Heartbeat = 2,
         DiscoveryRequest = 3,   // new in protocol v6: LAN broadcast (see DiscoveryPackets)
 
         // Server -> client
+        Snapshot = 100,
+        ShotsFired = 101,   // new in protocol v5 (see ShotsFiredPacket)
         DiscoveryResponse = 102, // new in protocol v6: answer to DiscoveryRequest
     }
 

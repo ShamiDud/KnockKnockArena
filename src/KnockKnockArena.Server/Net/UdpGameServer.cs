@@ -14,10 +14,12 @@ namespace KnockKnockArena.Server.Net;
 
 /// <summary>
 /// The UDP side of the game server: one socket for all clients (no thread per
-/// client — the pattern taught in T05), a receive thread that validates packets, and
-/// a tick thread that advances the world at a fixed 30 Hz.
+/// client — the pattern taught in T05), a receive thread that validates and queues
+/// packets, and a tick thread that advances the world at a fixed 30 Hz and sends a
+/// full snapshot to every joined player each tick.
 ///
-/// Module 5: join, heartbeat, timeout and LAN discovery. Inputs and snapshots come in M06.
+/// Module 9: the tick's events (kills, pickups taken, rocket explosions, damage) are
+/// handed to TCP, the reliable channel.
 /// </summary>
 public sealed class UdpGameServer
 {
@@ -29,6 +31,20 @@ public sealed class UdpGameServer
     /// <summary>Wired to TcpGameServer.KickByPlayerId: a UDP timeout disconnects the
     /// player entirely, which also produces the PlayerLeft event on TCP.</summary>
     public Action<byte, string>? KickPlayer;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPlayerDied: kills go out on TCP as
+    /// kill feed events (important events belong on the reliable channel).</summary>
+    public Action<KillEvent>? PlayerKilled;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPickupTaken.</summary>
+    public Action<PickupTakenEvent>? PickupTaken;
+
+    /// <summary>Wired to TcpGameServer.BroadcastRocketExploded.</summary>
+    public Action<RocketExplodedEvent>? RocketExploded;
+
+    /// <summary>Wired to TcpGameServer.BroadcastPlayerDamaged: the hit point, so
+    /// clients can play blood where the shot actually landed.</summary>
+    public Action<DamageEvent>? PlayerDamaged;
 
     public UdpGameServer(ServerConfig config, SessionManager sessions, GameWorld world)
     {
@@ -103,6 +119,10 @@ public sealed class UdpGameServer
                 HandleJoin(JoinPacket.FromDatagram(datagram), remote);
                 break;
 
+            case UdpPacketType.Input:
+                HandleInput(InputPacket.FromDatagram(datagram), remote);
+                break;
+
             case UdpPacketType.Heartbeat:
                 HandleHeartbeat(HeartbeatPacket.FromDatagram(datagram), remote);
                 break;
@@ -121,14 +141,48 @@ public sealed class UdpGameServer
         if (!_sessions.TryGetByToken(join.SessionToken, out PlayerSession? session))
             throw new ProtocolException("bad token");
 
-        bool joined = _world.SpawnOrRebind(session!, remote, out PlayerState player);
-        if (joined)
+        bool spawned = _world.SpawnOrRebind(session!, remote, out PlayerState player);
+        if (spawned)
             Log.Info($"UDP join: {session!.Username}#{session.PlayerId} from {remote} " +
                      $"({_world.PlayerCount} in game)");
         else if (!player.EndPoint.Equals(remote))
             Log.Info($"UDP rebind: {session!.Username}#{session.PlayerId} now at {remote}");
-        // A repeated Join from the same endpoint is normal (the client resends it,
-        // because UDP may lose it) and needs no log beyond the packet line.
+        // A repeated Join from the same endpoint is normal (the client resends
+        // until the first snapshot arrives) and needs no log beyond the packet line.
+    }
+
+    private void HandleInput(InputPacket input, IPEndPoint remote)
+    {
+        if (!_world.TryGetByEndPoint(remote, out PlayerState player))
+            throw new ProtocolException("unknown endpoint");
+        if (input.PlayerId != player.Session.PlayerId)
+            throw new ProtocolException($"bad player id {input.PlayerId}");
+
+        player.LastUdpPacketUtc = DateTime.UtcNow;
+        if (!_world.TryEnqueueInput(player, input, out string reason))
+            RejectInput(player, remote, reason);
+    }
+
+    /// <summary>
+    /// A dropped input goes in the packet log every time, but is warned about at most
+    /// once a second per player: a client that floods 60 inputs a second has about 30
+    /// dropped every second, and a warning for each would bury the console.
+    /// </summary>
+    private static void RejectInput(PlayerState player, IPEndPoint remote, string reason)
+    {
+        DateTime now = DateTime.UtcNow;
+        if (now - player.LastInputRejectWarningUtc < TimeSpan.FromSeconds(1))
+        {
+            player.InputRejectsSinceWarning++;
+            Log.Packet($"REJECT UDP from {remote}: {reason}");
+            return;
+        }
+        string more = player.InputRejectsSinceWarning > 0
+            ? $" (+{player.InputRejectsSinceWarning} dropped since the last warning)"
+            : "";
+        Log.Warn($"REJECT UDP from {remote}: {reason}{more}");
+        player.LastInputRejectWarningUtc = now;
+        player.InputRejectsSinceWarning = 0;
     }
 
     private void HandleHeartbeat(HeartbeatPacket heartbeat, IPEndPoint remote)
@@ -154,11 +208,11 @@ public sealed class UdpGameServer
         {
             Nonce = request.Nonce,
             GamePort = (ushort)_config.Port,
-            HttpPort = 0,        // no REST API before M10
+            // #03 HttpPort skrives her
             PlayersOnline = (byte)_sessions.Count,
             MaxPlayers = (byte)_config.MaxPlayers,
             ServerName = _config.ServerName,
-            MapName = "",        // no map before M06
+            MapName = ArenaMap.Name,
         }.ToDatagram();
         _udp!.Send(answer, answer.Length, remote);
         Log.Packet($"Discovery answer to {remote} (client speaks v{request.ClientVersion}, {answer.Length} B)");
@@ -172,7 +226,12 @@ public sealed class UdpGameServer
         double tickIntervalMs = 1000.0 / GameConstants.TickRate;
         double nextTickAtMs = tickIntervalMs;
 
+        List<(IPEndPoint EndPoint, byte[] Datagram)> snapshotSends = new();
         List<PlayerState> timedOut = new();
+        List<KillEvent> kills = new();
+        List<PickupTakenEvent> pickupsTaken = new();
+        List<RocketExplodedEvent> explosions = new();
+        List<DamageEvent> damage = new();
 
         while (true)
         {
@@ -191,8 +250,34 @@ public sealed class UdpGameServer
             }
             nextTickAtMs += tickIntervalMs;
 
+            snapshotSends.Clear();
             timedOut.Clear();
-            _world.Tick(timedOut);
+            kills.Clear();
+            pickupsTaken.Clear();
+            explosions.Clear();
+            damage.Clear();
+            _world.Tick(snapshotSends, timedOut, kills, pickupsTaken, explosions, damage);
+
+            foreach (KillEvent kill in kills)
+                PlayerKilled?.Invoke(kill);
+            foreach (PickupTakenEvent pickup in pickupsTaken)
+                PickupTaken?.Invoke(pickup);
+            foreach (RocketExplodedEvent explosion in explosions)
+                RocketExploded?.Invoke(explosion);
+            foreach (DamageEvent hit in damage)
+                PlayerDamaged?.Invoke(hit);
+
+            foreach ((IPEndPoint endPoint, byte[] datagram) in snapshotSends)
+            {
+                try
+                {
+                    _udp!.Send(datagram, datagram.Length, endPoint);
+                }
+                catch (SocketException)
+                {
+                    // Unreachable endpoint; the timeout will clean the player up.
+                }
+            }
 
             foreach (PlayerState player in timedOut)
             {
